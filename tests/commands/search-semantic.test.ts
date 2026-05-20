@@ -289,4 +289,22 @@ How to make the perfect sourdough bread.`
 
     expect(result.output).toBe("");
   });
+
+  it("multi-word hybrid scoring uses OR coverage (not AND boolean)", async () => {
+    // With AND logic: "JWT authentication patterns" would require ALL tokens
+    // With OR coverage: partial match should still boost keyword score
+    const provider = createHybridMockProvider();
+    const result = await searchCommand(store, "JWT authentication patterns", {
+      semantic: true,
+      memexHome: tmpDir,
+      _embeddingProvider: provider,
+    });
+
+    expect(result.exitCode).toBe(0);
+    // jwt-guide should rank first because it matches "JWT" keyword
+    // (all cards have equal semantic score from hybridMockProvider)
+    const jwtPos = result.output.indexOf("jwt-guide");
+    const unrelatedPos = result.output.indexOf("unrelated");
+    expect(jwtPos).toBeLessThan(unrelatedPos);
+  });
 });

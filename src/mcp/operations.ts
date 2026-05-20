@@ -29,9 +29,9 @@ export function registerOperations(
 
   // ---- recall ----
   server.registerTool("memex_recall", {
-    description: "IMPORTANT: You MUST call this at the START of every new task or conversation, BEFORE doing any work. This retrieves your persistent memory — knowledge cards from previous sessions with [[bidirectional links]]. Returns the keyword index (if exists) or card list. USAGE: Call with NO query first to get the index. Only use query when you need to find specific cards — pass 1-3 short keywords, NOT sentences or task summaries. Keyword search uses AND logic (every token must appear in the same card). For natural-language search, use memex_search with semantic=true instead. Never include actual secrets, credentials, tokens, or exact secret file contents in query.",
+    description: "IMPORTANT: You MUST call this at the START of every new task or conversation, BEFORE doing any work. This retrieves your persistent memory — knowledge cards from previous sessions with [[bidirectional links]]. Returns the keyword index (if exists) or card list. USAGE: Call with NO query first to get the index. Only use query when you need to find specific cards — multi-word queries work well (ranked OR with field-weighted scoring). For natural-language search, use memex_search with semantic=true instead. Never include actual secrets, credentials, tokens, or exact secret file contents in query.",
     inputSchema: z.object({
-      query: z.string().optional().describe("1-3 short keywords (AND logic — every token must appear). Do NOT pass sentences or task summaries. Omit for task-start recall. Examples: 'pptx migration', 'auth gotcha'. Do not include raw secrets."),
+      query: z.string().optional().describe("Keywords for ranked OR search — more matching tokens = higher rank. Multi-word queries are supported (e.g. 'JWT token rotation'). Omit for task-start recall. Do not include raw secrets."),
       category: z.string().optional().describe("Filter by frontmatter category"),
       tag: z.string().optional().describe("Filter by frontmatter tag"),
       author: z.string().optional().describe("Filter by frontmatter author/source"),
@@ -63,7 +63,7 @@ export function registerOperations(
       }
     }
 
-    const listResult = await searchCommand(store, undefined, { limit: 10, filter });
+    const listResult = await searchCommand(store, undefined, { limit: 10, filter, list: true });
     return { content: [{ type: "text" as const, text: listResult.output || "No cards yet." }] };
   });
 

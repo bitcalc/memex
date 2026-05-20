@@ -70,14 +70,15 @@ export function createMemexServer(store: CardStore, home?: string): McpServer {
   server.registerTool("memex_search", {
     description: "Low-level search. Prefer memex_recall for task-start workflows. Never include actual secrets, credentials, tokens, or exact secret file contents in query; use abstract descriptions instead.",
     inputSchema: z.object({
-      query: z.string().optional().describe("Search keyword. Omit to list all cards. Do not include raw secrets or credential values."),
+      query: z.string().optional().describe("Search keywords (OR logic — cards matching any token are ranked by coverage). Do not include raw secrets or credential values."),
       limit: z.number().optional().describe(`Max results (default 10, max ${MCP_MAX_RESULTS})`),
       semantic: z.boolean().optional().describe("Use embedding-based semantic search"),
+      list: z.boolean().optional().describe("When true with no query, list all cards instead of showing guidance"),
     }),
-  }, async ({ query, limit, semantic }) => {
+  }, async ({ query, limit, semantic, list }) => {
     const config = home ? await readConfig(home) : undefined;
     const clampedLimit = Math.min(limit ?? 10, MCP_MAX_RESULTS);
-    const result = await searchCommand(store, query, { limit: clampedLimit, semantic, config, memexHome: home });
+    const result = await searchCommand(store, query, { limit: clampedLimit, semantic, config, memexHome: home, list });
     return textResult(result.output || "No cards found.", result.exitCode !== 0);
   });
 

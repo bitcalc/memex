@@ -9,6 +9,13 @@ import {
   createEmbeddingProvider,
   type EmbeddingProvider,
 } from "../lib/embeddings.js";
+import {
+  tokenizeQuery,
+  buildSearchableFields,
+  scoreCard,
+  sortScoredMatches,
+  type ScoredMatch,
+} from "../lib/scoring.js";
 import { join } from "node:path";
 import { formatWarnings, prepareMemexInput, type SensitiveInputResult } from "../lib/sensitive-input.js";
 
@@ -32,6 +39,8 @@ interface SearchOptions {
   /** Override embedding provider (for testing). */
   _embeddingProvider?: EmbeddingProvider;
   filter?: ManifestFilter;
+  /** When true with no query, list cards instead of showing guidance. */
+  list?: boolean;
 }
 
 interface SearchResult {
@@ -87,8 +96,19 @@ export async function searchCommand(store: CardStore, query: string | undefined,
     return withWarnings(await semanticSearch(query, allCards, shouldPrefix, options), safety.warnings);
   }
 
-  // No query: list all cards (with limit)
+  // No query: guidance or list
   if (!query) {
+    // Show guidance only when no query, no filter, and no list flag
+    if (!options.list && !options.filter) {
+      const guidance = [
+        "No query provided. To search your knowledge base:",
+        "- memex read index — view your knowledge map",
+        "- memex search <keyword> — keyword search",
+        "- memex search --semantic <query> — natural language search",
+        "Use --list to browse all cards.",
+      ].join("\n");
+      return withWarnings({ output: guidance, exitCode: 0, totalCount: allCards.length }, safety.warnings);
+    }
     const rawLimit = options.limit ?? DEFAULT_LIMIT;
     const limit = rawLimit < 0 ? DEFAULT_LIMIT : rawLimit;
     const toProcess = limit > 0 ? allCards.slice(0, limit) : [];
@@ -200,7 +220,7 @@ function matchesFilter(data: Record<string, unknown>, filter: ManifestFilter): b
   return true;
 }
 
-// --- Keyword search ---
+// --- Keyword search (ranked lexical retrieval) ---
 
 async function keywordSearch(
   query: string,
@@ -211,45 +231,41 @@ async function keywordSearch(
   const rawLimit = options.limit ?? DEFAULT_LIMIT;
   const limit = rawLimit < 0 ? DEFAULT_LIMIT : rawLimit;
 
-  const matchedCards: { slug: string; matchLine: string; matchCount: number; store: CardStore; dirPrefix: string }[] = [];
+  const { tokens, originalTokens } = tokenizeQuery(query);
+  if (tokens.length === 0) return { output: "", exitCode: 0 };
 
-  // Split query into tokens — ALL tokens must appear (AND logic)
-  const tokens = query.split(/\s+/).filter(Boolean);
-  const escapedTokens = tokens.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const scored: ScoredMatch[] = [];
 
   for (const card of allCards) {
     const raw = await card.store.readCard(card.slug);
     const { data, content } = parseFrontmatter(raw);
-    const title = String(data.title || card.slug);
-    const searchText = title + "\n" + content;
+    const links = extractLinks(content);
+    const fields = buildSearchableFields(card.slug, data, content, links);
 
-    // Every token must appear (case-insensitive)
-    const allMatch = escapedTokens.every((t) => new RegExp(t, "i").test(searchText));
-    if (!allMatch) continue;
+    const match = scoreCard(tokens, originalTokens, fields);
+    if (!match) continue;
 
-    // Count total token hits for ranking
-    let matchCount = 0;
-    for (const t of escapedTokens) {
-      const hits = searchText.match(new RegExp(t, "gi"));
-      if (hits) matchCount += hits.length;
+    // Override slug with prefixed version if needed
+    if (shouldPrefix) {
+      match.slug = `${card.dirPrefix}/${card.slug}`;
     }
 
-    // Find first matching line (use first token for the preview line)
-    const lineRegex = new RegExp(escapedTokens[0], "i");
-    const bodyLines = content.split("\n");
-    const matchLine = bodyLines.find((l) => lineRegex.test(l))?.trim() || "";
-    matchedCards.push({ slug: card.slug, matchLine, matchCount, store: card.store, dirPrefix: card.dirPrefix });
+    scored.push(match);
   }
 
-  if (matchedCards.length === 0) return { output: "", exitCode: 0 };
+  if (scored.length === 0) return { output: "", exitCode: 0 };
 
-  // Sort by match count (most relevant first), take top N
-  matchedCards.sort((a, b) => b.matchCount - a.matchCount);
-  const topCards = matchedCards.slice(0, limit);
+  sortScoredMatches(scored);
+  const topCards = scored.slice(0, limit);
 
   const results: string[] = [];
   for (const matched of topCards) {
-    const raw = await matched.store.readCard(matched.slug);
+    // Re-read to get full content for display
+    const originalSlug = shouldPrefix ? matched.slug.split("/").slice(1).join("/") : matched.slug;
+    const card = allCards.find(c => c.slug === originalSlug || `${c.dirPrefix}/${c.slug}` === matched.slug);
+    if (!card) continue;
+
+    const raw = await card.store.readCard(card.slug);
     const { data, content } = parseFrontmatter(raw);
     const links = extractLinks(content);
     const paragraphs = content.trim().split(/\n\n+/);
@@ -257,14 +273,17 @@ async function keywordSearch(
 
     const showMatchLine = matched.matchLine && !firstParagraph.includes(matched.matchLine) ? matched.matchLine : null;
 
-    const prefixedSlug = shouldPrefix ? `${matched.dirPrefix}/${matched.slug}` : matched.slug;
+    // Only show matchedFields when it's a true metadata-only match (no body/heading matchLine found by scorer)
+    // Don't show it when matchLine was just suppressed because it's in firstParagraph
+    const showMatchedFields = matched.matchLine === "" ? matched.matchedFields : undefined;
 
     const item = {
-      slug: prefixedSlug,
-      title: String(data.title || matched.slug),
+      slug: matched.slug,
+      title: String(data.title || card.slug),
       firstParagraph,
       matchLine: showMatchLine,
       links,
+      matchedFields: showMatchedFields,
     };
 
     results.push(
@@ -274,7 +293,7 @@ async function keywordSearch(
     );
   }
 
-  return { output: results.join(options.compact ? "\n" : "\n\n"), exitCode: 0, totalCount: matchedCards.length };
+  return { output: results.join(options.compact ? "\n" : "\n\n"), exitCode: 0, totalCount: scored.length };
 }
 
 // --- Semantic search ---
@@ -328,9 +347,8 @@ async function semanticSearch(
   // Embed the query
   const [queryVector] = await provider.embed([query]);
 
-  // Run keyword matching for hybrid scoring
+  // Run keyword matching for hybrid scoring (returns 0-1 normalized scores)
   const keywordScores = await computeKeywordScores(query, allCards);
-  const maxKw = keywordScores.size > 0 ? Math.max(...keywordScores.values()) : 0;
 
   // Compute scores for all cards
   type ScoredCard = { slug: string; store: CardStore; dirPrefix: string; score: number };
@@ -341,13 +359,11 @@ async function semanticSearch(
     if (!entry) continue;
 
     const semScore = cosineSimilarity(queryVector, entry.vector);
-    const kwRaw = keywordScores.get(card.slug) ?? 0;
-    const kwNormalized = maxKw > 0 ? kwRaw / maxKw : 0;
+    const kwScore = keywordScores.get(card.slug) ?? 0;
 
-    // Hybrid scoring: 0.7 * semantic + 0.3 * keywordNormalized
-    const finalScore = kwRaw > 0
-      ? 0.7 * semScore + 0.3 * kwNormalized
-      : semScore;
+    // Hybrid scoring: semantic + additive keyword boost
+    // Keyword match always helps, never hurts
+    const finalScore = semScore + 0.3 * kwScore;
 
     scored.push({ slug: card.slug, store: card.store, dirPrefix: card.dirPrefix, score: finalScore });
   }
@@ -384,31 +400,25 @@ async function semanticSearch(
   return { output: results.join(options.compact ? "\n" : "\n\n"), exitCode: 0, totalCount: scored.length };
 }
 
-/** Compute keyword match counts per card slug (same logic as keyword search). */
+/** Compute keyword coverage scores per card slug (ranked OR, not AND boolean). */
 async function computeKeywordScores(
   query: string,
   allCards: Array<{ slug: string; store: CardStore; dirPrefix: string }>,
 ): Promise<Map<string, number>> {
   const scores = new Map<string, number>();
-  const tokens = query.split(/\s+/).filter(Boolean);
-  const escapedTokens = tokens.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const { tokens, originalTokens } = tokenizeQuery(query);
+  if (tokens.length === 0) return scores;
 
   for (const card of allCards) {
     const raw = await card.store.readCard(card.slug);
     const { data, content } = parseFrontmatter(raw);
-    const title = String(data.title || card.slug);
-    const searchText = title + "\n" + content;
+    const links = extractLinks(content);
+    const fields = buildSearchableFields(card.slug, data, content, links);
 
-    const allMatch = escapedTokens.every((t) => new RegExp(t, "i").test(searchText));
-    if (!allMatch) continue;
-
-    let matchCount = 0;
-    for (const t of escapedTokens) {
-      const hits = searchText.match(new RegExp(t, "gi"));
-      if (hits) matchCount += hits.length;
+    const match = scoreCard(tokens, originalTokens, fields);
+    if (match) {
+      scores.set(card.slug, match.score);
     }
-
-    scores.set(card.slug, matchCount);
   }
 
   return scores;

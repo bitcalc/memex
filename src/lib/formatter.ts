@@ -9,6 +9,7 @@ export interface SearchResultItem {
   firstParagraph: string;
   matchLine: string | null;
   links: string[];
+  matchedFields?: string[];   // e.g. ["tag:auth", "body:JWT"]
 }
 
 export interface LinkStatsItem {
@@ -32,6 +33,9 @@ export function formatSearchResult(result: SearchResultItem): string {
   lines.push(result.firstParagraph);
   if (result.matchLine) {
     lines.push(`> 匹配行: ${result.matchLine}`);
+  } else if (result.matchedFields && result.matchedFields.length > 0) {
+    // Metadata-only match: show which fields matched
+    lines.push(`> Matched: ${result.matchedFields.join(", ")}`);
   }
   if (result.links.length > 0) {
     lines.push(`Links: ${result.links.map((l) => `[[${l}]]`).join(", ")}`);

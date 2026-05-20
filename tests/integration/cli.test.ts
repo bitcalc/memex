@@ -61,12 +61,21 @@ Hello world.`;
     expect(stdout).toContain("Hello world.");
   });
 
-  it("search with no args lists all", async () => {
+  it("search with no args shows guidance", async () => {
     await writeFile(
       join(tmpDir, "cards", "a.md"),
       "---\ntitle: Alpha\ncreated: 2026-03-18\nmodified: 2026-03-18\nsource: manual\n---\nContent."
     );
     const { stdout } = await run(`node ${CLI_PATH} search`, { env });
+    expect(stdout).toContain("No query provided");
+  });
+
+  it("search --list lists all cards", async () => {
+    await writeFile(
+      join(tmpDir, "cards", "a.md"),
+      "---\ntitle: Alpha\ncreated: 2026-03-18\nmodified: 2026-03-18\nsource: manual\n---\nContent."
+    );
+    const { stdout } = await run(`node ${CLI_PATH} search --list`, { env });
     expect(stdout).toContain("Alpha");
   });
 
@@ -103,7 +112,7 @@ Nested content.`;
       join(tmpDir, "cards", "sub", "nested.md"),
       "---\ntitle: Nested\ncreated: 2026-03-18\nmodified: 2026-03-18\nsource: manual\n---\nContent."
     );
-    const { stdout } = await run(`node ${CLI_PATH} search`, { env });
+    const { stdout } = await run(`node ${CLI_PATH} search --list`, { env });
     expect(stdout).toContain("sub/nested");
   });
 
@@ -138,11 +147,11 @@ Nested content.`;
     );
 
     // Without --nested, search shows basename only
-    const { stdout: flat } = await run(`node ${CLI_PATH} search`, { env });
+    const { stdout: flat } = await run(`node ${CLI_PATH} search --list`, { env });
     expect(flat).not.toContain("sub/item");
 
     // With --nested, search shows full path slug
-    const { stdout: nested } = await run(`node ${CLI_PATH} search --nested`, { env });
+    const { stdout: nested } = await run(`node ${CLI_PATH} search --nested --list`, { env });
     expect(nested).toContain("sub/item");
   });
 });

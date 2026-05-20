@@ -321,8 +321,14 @@ Guide to setting up Docker for local development.`
     expect(result.output).not.toContain("old-notes");
   });
 
-  it("no filter applied when filter object is undefined", async () => {
+  it("no filter applied when filter object is undefined shows guidance", async () => {
     const result = await searchCommand(store, undefined);
+    // Without query or filter, shows guidance
+    expect(result.output).toContain("No query provided");
+  });
+
+  it("no filter with list:true lists all cards", async () => {
+    const result = await searchCommand(store, undefined, { list: true });
     // All cards should be listed
     expect(result.output).toContain("react-hooks");
     expect(result.output).toContain("api-auth");

@@ -57,11 +57,22 @@ describe("MCP server", () => {
     ]);
   });
 
-  it("memex_search lists all cards when no query", async () => {
+  it("memex_search shows guidance when no query", async () => {
     await setup({
       "test-card": "---\ntitle: Test Card\ncreated: 2026-01-01\nsource: retro\n---\nHello world",
     });
     const result = await client.callTool({ name: "memex_search", arguments: {} });
+    expect(result.isError).toBeFalsy();
+    const text = (result.content as Array<{ text: string }>)[0].text;
+    expect(text).toContain("No query provided");
+    expect(text).toContain("memex read index");
+  });
+
+  it("memex_search lists all cards when no query with list:true", async () => {
+    await setup({
+      "test-card": "---\ntitle: Test Card\ncreated: 2026-01-01\nsource: retro\n---\nHello world",
+    });
+    const result = await client.callTool({ name: "memex_search", arguments: { list: true } });
     expect(result.isError).toBeFalsy();
     const text = (result.content as Array<{ text: string }>)[0].text;
     expect(text).toContain("test-card");
@@ -188,7 +199,7 @@ describe("MCP server", () => {
     await setup(cards);
     const result = await client.callTool({
       name: "memex_search",
-      arguments: { limit: 100 },
+      arguments: { limit: 100, list: true },
     });
     const text = (result.content as Array<{ text: string }>)[0].text;
     // With 60 cards and limit clamped to 50, should show truncation

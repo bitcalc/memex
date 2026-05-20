@@ -7483,6 +7483,8 @@ function formatSearchResult(result) {
   lines.push(result.firstParagraph);
   if (result.matchLine) {
     lines.push(`> \u5339\u914D\u884C: ${result.matchLine}`);
+  } else if (result.matchedFields && result.matchedFields.length > 0) {
+    lines.push(`> Matched: ${result.matchedFields.join(", ")}`);
   }
   if (result.links.length > 0) {
     lines.push(`Links: ${result.links.map((l) => `[[${l}]]`).join(", ")}`);
@@ -8049,6 +8051,379 @@ var init_embeddings = __esm({
   }
 });
 
+// src/lib/scoring.ts
+function isCodeToken(originalToken) {
+  return CODE_TOKEN_RE.test(originalToken);
+}
+function tokenizeQuery(query) {
+  const rawSegments = extractTokenSegments(query);
+  const expanded = expandCompoundTokens(rawSegments);
+  const originalCasingMap = /* @__PURE__ */ new Map();
+  for (const t of expanded) {
+    const lower = t.toLowerCase();
+    if (!originalCasingMap.has(lower)) {
+      originalCasingMap.set(lower, t);
+    }
+  }
+  const deduped = [...new Set(expanded.map((t) => t.toLowerCase()))];
+  const originalTokensAll = deduped.map((t) => originalCasingMap.get(t) ?? t);
+  const stopwordsRemoved = [];
+  const tokens = [];
+  const originalTokensFiltered = [];
+  for (let i = 0; i < deduped.length; i++) {
+    const t = deduped[i];
+    if (ALL_STOPWORDS.has(t)) {
+      stopwordsRemoved.push(t);
+    } else {
+      tokens.push(t);
+      originalTokensFiltered.push(originalTokensAll[i]);
+    }
+  }
+  if (tokens.length === 0 && deduped.length > 0) {
+    return { tokens: deduped, originalTokens: originalTokensAll, stopwordsRemoved: [] };
+  }
+  return { tokens, originalTokens: originalTokensFiltered, stopwordsRemoved };
+}
+function extractTokenSegments(text) {
+  const segments = [];
+  for (const match of text.matchAll(ASCII_TOKEN_RE)) {
+    segments.push(match[0]);
+  }
+  for (const match of text.matchAll(CJK_RE)) {
+    segments.push(match[0]);
+  }
+  return segments;
+}
+function expandCompoundTokens(tokens) {
+  const result = [];
+  for (const token of tokens) {
+    result.push(token);
+    if (/[-_.\/]/.test(token)) {
+      const parts = token.split(/[-_.\/]+/).filter(Boolean);
+      if (parts.length > 1) {
+        for (const part of parts) {
+          result.push(part);
+        }
+      }
+    }
+  }
+  return result;
+}
+function matchTokenInField(token, field, fields, originalToken) {
+  const t = token.toLowerCase();
+  const weight = FIELD_WEIGHTS[field];
+  switch (field) {
+    case "slug":
+      return matchSegment(t, fields.slug, /[-_\/]/g) ? weight : 0;
+    case "title":
+      if (matchSegment(t, fields.title, /[\s\-_]/g)) return weight;
+      if (CJK_CHAR_RE.test(token) && fields.title.toLowerCase().includes(t)) return weight;
+      return 0;
+    case "tags": {
+      for (const tag of fields.tags) {
+        if (tag.toLowerCase() === t) return weight;
+      }
+      for (const tag of fields.tags) {
+        if (matchSegment(t, tag, /[-_]/g)) return weight * SEGMENT_MATCH_PENALTY;
+      }
+      return 0;
+    }
+    case "category": {
+      const cat = fields.category.toLowerCase();
+      if (cat === t) return weight;
+      if (matchSegment(t, fields.category, /[-_]/g)) return weight * SEGMENT_MATCH_PENALTY;
+      return 0;
+    }
+    case "headings": {
+      if (CJK_CHAR_RE.test(token)) {
+        for (const h of fields.headings) {
+          if (h.toLowerCase().includes(t)) return weight;
+        }
+        return 0;
+      }
+      const escaped = escapeRegex(t);
+      const re = new RegExp(`\\b${escaped}\\b`, "i");
+      for (const h of fields.headings) {
+        if (re.test(h)) {
+          const codeBoost = isCodeToken(originalToken) ? CODE_TOKEN_BOOST : 1;
+          return Math.min(weight * codeBoost, MAX_FIELD_WEIGHT);
+        }
+      }
+      return 0;
+    }
+    case "wikilinks":
+      for (const link of fields.wikilinks) {
+        if (matchSegment(t, link, /[-]/g)) return weight;
+      }
+      return 0;
+    case "body": {
+      if (CJK_CHAR_RE.test(token)) {
+        if (fields.body.toLowerCase().includes(t)) return weight;
+        return 0;
+      }
+      const escaped = escapeRegex(t);
+      const re = new RegExp(`\\b${escaped}\\b`, "i");
+      if (re.test(fields.body)) {
+        const codeBoost = isCodeToken(originalToken) ? CODE_TOKEN_BOOST : 1;
+        return Math.min(weight * codeBoost, MAX_FIELD_WEIGHT);
+      }
+      return 0;
+    }
+  }
+}
+function matchSegment(token, text, separatorRe) {
+  const segments = text.toLowerCase().split(separatorRe).filter(Boolean);
+  return segments.includes(token);
+}
+function escapeRegex(str2) {
+  return str2.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function buildSearchableFields(slug, data, content, wikilinks) {
+  const title = String(data.title || slug);
+  let tags = [];
+  const rawTags = data.tags ?? data.tag;
+  if (Array.isArray(rawTags)) {
+    tags = rawTags.map((t) => String(t).trim()).filter(Boolean);
+  } else if (typeof rawTags === "string") {
+    tags = rawTags.split(",").map((t) => t.trim()).filter(Boolean);
+  }
+  const category = typeof data.category === "string" ? data.category : "";
+  const headings = [];
+  for (const line of content.split("\n")) {
+    if (/^#{1,6}\s/.test(line)) {
+      headings.push(line.replace(/^#{1,6}\s+/, "").trim());
+    }
+  }
+  const bodyLines = content.split("\n");
+  return { slug, title, tags, category, headings, wikilinks, body: content, bodyLines };
+}
+function scoreCard(tokens, originalTokens, fields) {
+  const effectiveTokens = tokens.length;
+  if (effectiveTokens === 0) return null;
+  let totalScore = 0;
+  let matchedCount = 0;
+  const matchedFields = [];
+  let firstMatchLine = "";
+  let hasHighSignalMatch = false;
+  const originalMap = /* @__PURE__ */ new Map();
+  for (const ot of originalTokens) {
+    originalMap.set(ot.toLowerCase(), ot);
+  }
+  for (const token of tokens) {
+    const origToken = originalMap.get(token) ?? token;
+    let bestWeight = 0;
+    let bestField = "";
+    for (const field of FIELD_ORDER) {
+      const w = matchTokenInField(token, field, fields, origToken);
+      if (w > bestWeight) {
+        bestWeight = w;
+        bestField = field;
+      }
+    }
+    if (bestWeight > 0) {
+      totalScore += bestWeight;
+      matchedCount++;
+      matchedFields.push(`${bestField}:${token}`);
+      if (isHighSignalMatch(token, bestField)) {
+        hasHighSignalMatch = true;
+      }
+      if (!firstMatchLine) {
+        firstMatchLine = findMatchLine(token, origToken, fields);
+      }
+    }
+  }
+  if (matchedCount === 0) return null;
+  const coverage = matchedCount / effectiveTokens;
+  const normalizedScore = totalScore / (effectiveTokens * MAX_FIELD_WEIGHT);
+  if (!meetsThreshold(effectiveTokens, matchedCount, hasHighSignalMatch)) {
+    return null;
+  }
+  return {
+    slug: fields.slug,
+    score: normalizedScore,
+    coverage,
+    matchedTokens: matchedCount,
+    effectiveTokens,
+    matchLine: firstMatchLine,
+    matchedFields
+  };
+}
+function isHighSignalMatch(token, field) {
+  if (field === "tags") return true;
+  if (field === "slug" || field === "title") {
+    if (ALL_STOPWORDS.has(token)) return false;
+    if (CJK_CHAR_RE.test(token)) return true;
+    if (token.length < 3 && !isCodeToken(token)) return false;
+    if (LOW_SIGNAL_TOKENS.has(token)) return false;
+    return true;
+  }
+  return false;
+}
+function meetsThreshold(effectiveTokens, matchedTokens, hasHighSignalMatch) {
+  if (effectiveTokens < 4) return true;
+  if (hasHighSignalMatch) return true;
+  const minRequired = Math.max(2, Math.ceil(0.3 * effectiveTokens));
+  return matchedTokens >= minRequired;
+}
+function findMatchLine(token, originalToken, fields) {
+  const escaped = escapeRegex(token);
+  if (CJK_CHAR_RE.test(token)) {
+    for (const line of fields.bodyLines) {
+      if (line.toLowerCase().includes(token)) {
+        return line.trim();
+      }
+    }
+  } else {
+    const re = new RegExp(`\\b${escaped}\\b`, "i");
+    for (const line of fields.bodyLines) {
+      if (re.test(line)) {
+        return line.trim();
+      }
+    }
+  }
+  const headingRe = new RegExp(`\\b${escaped}\\b`, "i");
+  for (const h of fields.headings) {
+    if (headingRe.test(h)) {
+      return h;
+    }
+  }
+  return "";
+}
+function sortScoredMatches(matches) {
+  return matches.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.coverage !== a.coverage) return b.coverage - a.coverage;
+    return a.slug.localeCompare(b.slug);
+  });
+}
+var FIELD_WEIGHTS, MAX_FIELD_WEIGHT, CODE_TOKEN_BOOST, SEGMENT_MATCH_PENALTY, EN_STOPWORDS, CJK_STOPWORDS, ALL_STOPWORDS, CODE_TOKEN_RE, CJK_RE, CJK_CHAR_RE, ASCII_TOKEN_RE, FIELD_ORDER, LOW_SIGNAL_TOKENS;
+var init_scoring = __esm({
+  "src/lib/scoring.ts"() {
+    "use strict";
+    FIELD_WEIGHTS = {
+      slug: 5,
+      title: 5,
+      tags: 4,
+      category: 3,
+      headings: 3,
+      wikilinks: 2,
+      body: 1
+    };
+    MAX_FIELD_WEIGHT = Math.max(...Object.values(FIELD_WEIGHTS));
+    CODE_TOKEN_BOOST = 2;
+    SEGMENT_MATCH_PENALTY = 0.8;
+    EN_STOPWORDS = /* @__PURE__ */ new Set([
+      "how",
+      "what",
+      "when",
+      "where",
+      "why",
+      "which",
+      "can",
+      "does",
+      "should",
+      "would",
+      "could",
+      "the",
+      "a",
+      "an",
+      "is",
+      "are",
+      "was",
+      "were",
+      "be",
+      "been",
+      "to",
+      "of",
+      "in",
+      "for",
+      "on",
+      "with",
+      "at",
+      "by",
+      "from",
+      "as",
+      "into",
+      "about",
+      "fix",
+      "use",
+      "get",
+      "set",
+      "make",
+      "do",
+      "did"
+    ]);
+    CJK_STOPWORDS = /* @__PURE__ */ new Set([
+      "\u7684",
+      "\u4E86",
+      "\u662F",
+      "\u5728",
+      "\u6211",
+      "\u8FD9\u4E2A",
+      "\u90A3\u4E2A",
+      "\u4EC0\u4E48",
+      "\u600E\u4E48",
+      "\u5982\u4F55",
+      "\u95EE\u9898",
+      "\u5B9E\u73B0",
+      "\u4F7F\u7528",
+      "\u4E00\u4E2A"
+    ]);
+    ALL_STOPWORDS = /* @__PURE__ */ new Set([...EN_STOPWORDS, ...CJK_STOPWORDS]);
+    CODE_TOKEN_RE = /(?:[A-Z]{2,}$|[a-z][a-zA-Z]*[A-Z]|[A-Z][a-z]+[A-Z]|\d|[_.\/])/;
+    CJK_RE = new RegExp("\\p{Unified_Ideograph}+", "gu");
+    CJK_CHAR_RE = new RegExp("\\p{Unified_Ideograph}", "u");
+    ASCII_TOKEN_RE = /[a-zA-Z0-9_\-./]+/g;
+    FIELD_ORDER = [
+      "slug",
+      "title",
+      "tags",
+      "category",
+      "headings",
+      "wikilinks",
+      "body"
+    ];
+    LOW_SIGNAL_TOKENS = /* @__PURE__ */ new Set([
+      "guide",
+      "pattern",
+      "patterns",
+      "server",
+      "config",
+      "setup",
+      "test",
+      "testing",
+      "flow",
+      "workflow",
+      "deployment",
+      "service",
+      "client",
+      "handler",
+      "manager",
+      "helper",
+      "util",
+      "utils",
+      "base",
+      "core",
+      "common",
+      "shared",
+      "default",
+      "main",
+      "index",
+      "list",
+      "item",
+      "data",
+      "info",
+      "detail",
+      "new",
+      "old",
+      "tmp",
+      "temp",
+      "app",
+      "api"
+    ]);
+  }
+});
+
 // src/commands/search.ts
 import { join as join4 } from "node:path";
 async function searchCommand(store, query, options2 = {}) {
@@ -8084,6 +8459,16 @@ async function searchCommand(store, query, options2 = {}) {
     return withWarnings(await semanticSearch(query, allCards, shouldPrefix, options2), safety.warnings);
   }
   if (!query) {
+    if (!options2.list && !options2.filter) {
+      const guidance = [
+        "No query provided. To search your knowledge base:",
+        "- memex read index \u2014 view your knowledge map",
+        "- memex search <keyword> \u2014 keyword search",
+        "- memex search --semantic <query> \u2014 natural language search",
+        "Use --list to browse all cards."
+      ].join("\n");
+      return withWarnings({ output: guidance, exitCode: 0, totalCount: allCards.length }, safety.warnings);
+    }
     const rawLimit = options2.limit ?? DEFAULT_LIMIT;
     const limit = rawLimit < 0 ? DEFAULT_LIMIT : rawLimit;
     const toProcess = limit > 0 ? allCards.slice(0, limit) : [];
@@ -8175,50 +8560,49 @@ function matchesFilter(data, filter) {
 async function keywordSearch(query, allCards, shouldPrefix, options2) {
   const rawLimit = options2.limit ?? DEFAULT_LIMIT;
   const limit = rawLimit < 0 ? DEFAULT_LIMIT : rawLimit;
-  const matchedCards = [];
-  const tokens = query.split(/\s+/).filter(Boolean);
-  const escapedTokens = tokens.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const { tokens, originalTokens } = tokenizeQuery(query);
+  if (tokens.length === 0) return { output: "", exitCode: 0 };
+  const scored = [];
   for (const card of allCards) {
     const raw = await card.store.readCard(card.slug);
     const { data, content } = parseFrontmatter(raw);
-    const title = String(data.title || card.slug);
-    const searchText = title + "\n" + content;
-    const allMatch = escapedTokens.every((t) => new RegExp(t, "i").test(searchText));
-    if (!allMatch) continue;
-    let matchCount = 0;
-    for (const t of escapedTokens) {
-      const hits = searchText.match(new RegExp(t, "gi"));
-      if (hits) matchCount += hits.length;
+    const links = extractLinks(content);
+    const fields = buildSearchableFields(card.slug, data, content, links);
+    const match = scoreCard(tokens, originalTokens, fields);
+    if (!match) continue;
+    if (shouldPrefix) {
+      match.slug = `${card.dirPrefix}/${card.slug}`;
     }
-    const lineRegex = new RegExp(escapedTokens[0], "i");
-    const bodyLines = content.split("\n");
-    const matchLine = bodyLines.find((l) => lineRegex.test(l))?.trim() || "";
-    matchedCards.push({ slug: card.slug, matchLine, matchCount, store: card.store, dirPrefix: card.dirPrefix });
+    scored.push(match);
   }
-  if (matchedCards.length === 0) return { output: "", exitCode: 0 };
-  matchedCards.sort((a, b) => b.matchCount - a.matchCount);
-  const topCards = matchedCards.slice(0, limit);
+  if (scored.length === 0) return { output: "", exitCode: 0 };
+  sortScoredMatches(scored);
+  const topCards = scored.slice(0, limit);
   const results = [];
   for (const matched of topCards) {
-    const raw = await matched.store.readCard(matched.slug);
+    const originalSlug = shouldPrefix ? matched.slug.split("/").slice(1).join("/") : matched.slug;
+    const card = allCards.find((c) => c.slug === originalSlug || `${c.dirPrefix}/${c.slug}` === matched.slug);
+    if (!card) continue;
+    const raw = await card.store.readCard(card.slug);
     const { data, content } = parseFrontmatter(raw);
     const links = extractLinks(content);
     const paragraphs = content.trim().split(/\n\n+/);
     const firstParagraph = paragraphs[0]?.trim() || "";
     const showMatchLine = matched.matchLine && !firstParagraph.includes(matched.matchLine) ? matched.matchLine : null;
-    const prefixedSlug = shouldPrefix ? `${matched.dirPrefix}/${matched.slug}` : matched.slug;
+    const showMatchedFields = matched.matchLine === "" ? matched.matchedFields : void 0;
     const item = {
-      slug: prefixedSlug,
-      title: String(data.title || matched.slug),
+      slug: matched.slug,
+      title: String(data.title || card.slug),
       firstParagraph,
       matchLine: showMatchLine,
-      links
+      links,
+      matchedFields: showMatchedFields
     };
     results.push(
       options2.compact ? formatCompactSearchResult(item) : formatSearchResult(item)
     );
   }
-  return { output: results.join(options2.compact ? "\n" : "\n\n"), exitCode: 0, totalCount: matchedCards.length };
+  return { output: results.join(options2.compact ? "\n" : "\n\n"), exitCode: 0, totalCount: scored.length };
 }
 async function semanticSearch(query, allCards, shouldPrefix, options2) {
   const rawLimit = options2.limit ?? DEFAULT_LIMIT;
@@ -8256,15 +8640,13 @@ async function semanticSearch(query, allCards, shouldPrefix, options2) {
   await cache.save();
   const [queryVector] = await provider.embed([query]);
   const keywordScores = await computeKeywordScores(query, allCards);
-  const maxKw = keywordScores.size > 0 ? Math.max(...keywordScores.values()) : 0;
   const scored = [];
   for (const card of allCards) {
     const entry = cache.get(card.slug);
     if (!entry) continue;
     const semScore = cosineSimilarity(queryVector, entry.vector);
-    const kwRaw = keywordScores.get(card.slug) ?? 0;
-    const kwNormalized = maxKw > 0 ? kwRaw / maxKw : 0;
-    const finalScore = kwRaw > 0 ? 0.7 * semScore + 0.3 * kwNormalized : semScore;
+    const kwScore = keywordScores.get(card.slug) ?? 0;
+    const finalScore = semScore + 0.3 * kwScore;
     scored.push({ slug: card.slug, store: card.store, dirPrefix: card.dirPrefix, score: finalScore });
   }
   scored.sort((a, b) => b.score - a.score);
@@ -8292,21 +8674,17 @@ async function semanticSearch(query, allCards, shouldPrefix, options2) {
 }
 async function computeKeywordScores(query, allCards) {
   const scores = /* @__PURE__ */ new Map();
-  const tokens = query.split(/\s+/).filter(Boolean);
-  const escapedTokens = tokens.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const { tokens, originalTokens } = tokenizeQuery(query);
+  if (tokens.length === 0) return scores;
   for (const card of allCards) {
     const raw = await card.store.readCard(card.slug);
     const { data, content } = parseFrontmatter(raw);
-    const title = String(data.title || card.slug);
-    const searchText = title + "\n" + content;
-    const allMatch = escapedTokens.every((t) => new RegExp(t, "i").test(searchText));
-    if (!allMatch) continue;
-    let matchCount = 0;
-    for (const t of escapedTokens) {
-      const hits = searchText.match(new RegExp(t, "gi"));
-      if (hits) matchCount += hits.length;
+    const links = extractLinks(content);
+    const fields = buildSearchableFields(card.slug, data, content, links);
+    const match = scoreCard(tokens, originalTokens, fields);
+    if (match) {
+      scores.set(card.slug, match.score);
     }
-    scores.set(card.slug, matchCount);
   }
   return scores;
 }
@@ -8329,6 +8707,7 @@ var init_search = __esm({
     init_parser();
     init_formatter();
     init_embeddings();
+    init_scoring();
     init_sensitive_input();
     DEFAULT_LIMIT = 10;
   }
@@ -13463,7 +13842,7 @@ __export(util_exports, {
   createTransparentProxy: () => createTransparentProxy,
   defineLazy: () => defineLazy,
   esc: () => esc,
-  escapeRegex: () => escapeRegex,
+  escapeRegex: () => escapeRegex2,
   extend: () => extend,
   finalizeIssue: () => finalizeIssue,
   floatSafeRemainder: () => floatSafeRemainder2,
@@ -13675,7 +14054,7 @@ function numKeys(data) {
   }
   return keyCount;
 }
-function escapeRegex(str2) {
+function escapeRegex2(str2) {
   return str2.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 function clone(inst, def, params) {
@@ -14481,7 +14860,7 @@ var init_regexes = __esm({
     ipv4 = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$/;
     ipv6 = /^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$/;
     mac = (delimiter) => {
-      const escapedDelim = escapeRegex(delimiter ?? ":");
+      const escapedDelim = escapeRegex2(delimiter ?? ":");
       return new RegExp(`^(?:[0-9A-F]{2}${escapedDelim}){5}[0-9A-F]{2}$|^(?:[0-9a-f]{2}${escapedDelim}){5}[0-9a-f]{2}$`);
     };
     cidrv4 = /^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\/([0-9]|[1-2][0-9]|3[0-2])$/;
@@ -14971,7 +15350,7 @@ var init_checks = __esm({
     });
     $ZodCheckIncludes = /* @__PURE__ */ $constructor("$ZodCheckIncludes", (inst, def) => {
       $ZodCheck.init(inst, def);
-      const escapedRegex = escapeRegex(def.includes);
+      const escapedRegex = escapeRegex2(def.includes);
       const pattern = new RegExp(typeof def.position === "number" ? `^.{${def.position}}${escapedRegex}` : escapedRegex);
       def.pattern = pattern;
       inst._zod.onattach.push((inst2) => {
@@ -14995,7 +15374,7 @@ var init_checks = __esm({
     });
     $ZodCheckStartsWith = /* @__PURE__ */ $constructor("$ZodCheckStartsWith", (inst, def) => {
       $ZodCheck.init(inst, def);
-      const pattern = new RegExp(`^${escapeRegex(def.prefix)}.*`);
+      const pattern = new RegExp(`^${escapeRegex2(def.prefix)}.*`);
       def.pattern ?? (def.pattern = pattern);
       inst._zod.onattach.push((inst2) => {
         const bag = inst2._zod.bag;
@@ -15018,7 +15397,7 @@ var init_checks = __esm({
     });
     $ZodCheckEndsWith = /* @__PURE__ */ $constructor("$ZodCheckEndsWith", (inst, def) => {
       $ZodCheck.init(inst, def);
-      const pattern = new RegExp(`.*${escapeRegex(def.suffix)}$`);
+      const pattern = new RegExp(`.*${escapeRegex2(def.suffix)}$`);
       def.pattern ?? (def.pattern = pattern);
       inst._zod.onattach.push((inst2) => {
         const bag = inst2._zod.bag;
@@ -16656,7 +17035,7 @@ var init_schemas = __esm({
       const values = getEnumValues(def.entries);
       const valuesSet = new Set(values);
       inst._zod.values = valuesSet;
-      inst._zod.pattern = new RegExp(`^(${values.filter((k) => propertyKeyTypes.has(typeof k)).map((o) => typeof o === "string" ? escapeRegex(o) : o.toString()).join("|")})$`);
+      inst._zod.pattern = new RegExp(`^(${values.filter((k) => propertyKeyTypes.has(typeof k)).map((o) => typeof o === "string" ? escapeRegex2(o) : o.toString()).join("|")})$`);
       inst._zod.parse = (payload, _ctx) => {
         const input = payload.value;
         if (valuesSet.has(input)) {
@@ -16678,7 +17057,7 @@ var init_schemas = __esm({
       }
       const values = new Set(def.values);
       inst._zod.values = values;
-      inst._zod.pattern = new RegExp(`^(${def.values.map((o) => typeof o === "string" ? escapeRegex(o) : o ? escapeRegex(o.toString()) : String(o)).join("|")})$`);
+      inst._zod.pattern = new RegExp(`^(${def.values.map((o) => typeof o === "string" ? escapeRegex2(o) : o ? escapeRegex2(o.toString()) : String(o)).join("|")})$`);
       inst._zod.parse = (payload, _ctx) => {
         const input = payload.value;
         if (values.has(input)) {
@@ -16973,7 +17352,7 @@ var init_schemas = __esm({
           const end = source.endsWith("$") ? source.length - 1 : source.length;
           regexParts.push(source.slice(start, end));
         } else if (part === null || primitiveTypes.has(typeof part)) {
-          regexParts.push(escapeRegex(`${part}`));
+          regexParts.push(escapeRegex2(`${part}`));
         } else {
           throw new Error(`Invalid template literal part: ${part}`);
         }
@@ -40486,9 +40865,9 @@ function registerOperations(server, store, hooks, home, getClientName) {
     return { content: [{ type: "text", text }], isError };
   }
   server.registerTool("memex_recall", {
-    description: "IMPORTANT: You MUST call this at the START of every new task or conversation, BEFORE doing any work. This retrieves your persistent memory \u2014 knowledge cards from previous sessions with [[bidirectional links]]. Returns the keyword index (if exists) or card list. USAGE: Call with NO query first to get the index. Only use query when you need to find specific cards \u2014 pass 1-3 short keywords, NOT sentences or task summaries. Keyword search uses AND logic (every token must appear in the same card). For natural-language search, use memex_search with semantic=true instead. Never include actual secrets, credentials, tokens, or exact secret file contents in query.",
+    description: "IMPORTANT: You MUST call this at the START of every new task or conversation, BEFORE doing any work. This retrieves your persistent memory \u2014 knowledge cards from previous sessions with [[bidirectional links]]. Returns the keyword index (if exists) or card list. USAGE: Call with NO query first to get the index. Only use query when you need to find specific cards \u2014 multi-word queries work well (ranked OR with field-weighted scoring). For natural-language search, use memex_search with semantic=true instead. Never include actual secrets, credentials, tokens, or exact secret file contents in query.",
     inputSchema: external_exports3.object({
-      query: external_exports3.string().optional().describe("1-3 short keywords (AND logic \u2014 every token must appear). Do NOT pass sentences or task summaries. Omit for task-start recall. Examples: 'pptx migration', 'auth gotcha'. Do not include raw secrets."),
+      query: external_exports3.string().optional().describe("Keywords for ranked OR search \u2014 more matching tokens = higher rank. Multi-word queries are supported (e.g. 'JWT token rotation'). Omit for task-start recall. Do not include raw secrets."),
       category: external_exports3.string().optional().describe("Filter by frontmatter category"),
       tag: external_exports3.string().optional().describe("Filter by frontmatter tag"),
       author: external_exports3.string().optional().describe("Filter by frontmatter author/source"),
@@ -40513,7 +40892,7 @@ function registerOperations(server, store, hooks, home, getClientName) {
         return { content: [{ type: "text", text: summary }] };
       }
     }
-    const listResult = await searchCommand(store, void 0, { limit: 10, filter });
+    const listResult = await searchCommand(store, void 0, { limit: 10, filter, list: true });
     return { content: [{ type: "text", text: listResult.output || "No cards yet." }] };
   });
   server.registerTool("memex_retro", {
@@ -40747,14 +41126,15 @@ ${formatWarnings(warnings)}` : "";
   server.registerTool("memex_search", {
     description: "Low-level search. Prefer memex_recall for task-start workflows. Never include actual secrets, credentials, tokens, or exact secret file contents in query; use abstract descriptions instead.",
     inputSchema: external_exports3.object({
-      query: external_exports3.string().optional().describe("Search keyword. Omit to list all cards. Do not include raw secrets or credential values."),
+      query: external_exports3.string().optional().describe("Search keywords (OR logic \u2014 cards matching any token are ranked by coverage). Do not include raw secrets or credential values."),
       limit: external_exports3.number().optional().describe(`Max results (default 10, max ${MCP_MAX_RESULTS})`),
-      semantic: external_exports3.boolean().optional().describe("Use embedding-based semantic search")
+      semantic: external_exports3.boolean().optional().describe("Use embedding-based semantic search"),
+      list: external_exports3.boolean().optional().describe("When true with no query, list all cards instead of showing guidance")
     })
-  }, async ({ query, limit, semantic }) => {
+  }, async ({ query, limit, semantic, list }) => {
     const config2 = home ? await readConfig(home) : void 0;
     const clampedLimit = Math.min(limit ?? 10, MCP_MAX_RESULTS);
-    const result = await searchCommand(store, query, { limit: clampedLimit, semantic, config: config2, memexHome: home });
+    const result = await searchCommand(store, query, { limit: clampedLimit, semantic, config: config2, memexHome: home, list });
     return textResult(result.output || "No cards found.", result.exitCode !== 0);
   });
   server.registerTool("memex_read", {
@@ -41829,12 +42209,12 @@ async function readStdin() {
 }
 var program2 = new Command();
 program2.name("memex").description("Zettelkasten agent memory CLI").version(pkg2.version);
-program2.command("search [query]").description("Full-text search cards (body only), or list all if no query").option("-l, --limit <n>", "Max results to return", "10").option("--nested", "Use nested (path-preserving) slugs for this command").option("--all", "Search across all configured searchDirs in addition to cards/").option("-s, --semantic", "Use embedding-based semantic search").option("-c, --compact", "Compact output (one line per result)").option("--category <value>", "Filter by frontmatter category").option("--tag <value>", "Filter by frontmatter tag").option("--author <value>", "Filter by frontmatter author/source").option("--since <date>", "Only cards created/modified after this date (YYYY-MM-DD)").option("--before <date>", "Only cards created/modified before this date (YYYY-MM-DD)").action(async (query, opts) => {
+program2.command("search [query]").description("Search cards by keyword (ranked OR), or show guidance if no query").option("-l, --limit <n>", "Max results to return", "10").option("--nested", "Use nested (path-preserving) slugs for this command").option("--all", "Search across all configured searchDirs in addition to cards/").option("-s, --semantic", "Use embedding-based semantic search").option("-c, --compact", "Compact output (one line per result)").option("--list", "List all cards (when no query is given)").option("--category <value>", "Filter by frontmatter category").option("--tag <value>", "Filter by frontmatter tag").option("--author <value>", "Filter by frontmatter author/source").option("--since <date>", "Only cards created/modified after this date (YYYY-MM-DD)").option("--before <date>", "Only cards created/modified before this date (YYYY-MM-DD)").action(async (query, opts) => {
   const home = await resolveMemexHome();
   const config2 = await readConfig(home);
   const store = await getStore({ nested: opts.nested });
   const filter = opts.category || opts.tag || opts.author || opts.since || opts.before ? { category: opts.category, tag: opts.tag, author: opts.author, since: opts.since, before: opts.before } : void 0;
-  const result = await searchCommand(store, query, { limit: parseInt(opts.limit), all: opts.all, config: config2, memexHome: home, semantic: opts.semantic, compact: opts.compact, filter });
+  const result = await searchCommand(store, query, { limit: parseInt(opts.limit), all: opts.all, config: config2, memexHome: home, semantic: opts.semantic, compact: opts.compact, list: opts.list, filter });
   if (result.output) {
     const stream = result.exitCode === 0 ? process.stdout : process.stderr;
     stream.write(result.output + "\n");
