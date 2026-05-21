@@ -51,6 +51,9 @@ const CODE_TOKEN_BOOST = 2;
 // Tag/category segment match gets slightly lower weight than whole exact match
 const SEGMENT_MATCH_PENALTY = 0.8;
 
+// Low-signal tokens in slug/title get heavily penalized in scoring
+const LOW_SIGNAL_PENALTY = 0.25;
+
 const EN_STOPWORDS = new Set([
   "how", "what", "when", "where", "why", "which", "can", "does", "should",
   "would", "could", "the", "a", "an", "is", "are", "was", "were", "be",
@@ -179,14 +182,17 @@ function matchTokenInField(
   const weight = FIELD_WEIGHTS[field];
 
   switch (field) {
-    case "slug":
-      return matchSegment(t, fields.slug, /[-_\/]/g) ? weight : 0;
+    case "slug": {
+      if (!matchSegment(t, fields.slug, /[-_\/]/g)) return 0;
+      return LOW_SIGNAL_TOKENS.has(t) ? weight * LOW_SIGNAL_PENALTY : weight;
+    }
 
-    case "title":
-      if (matchSegment(t, fields.title, /[\s\-_]/g)) return weight;
-      // CJK substring fallback
-      if (CJK_CHAR_RE.test(token) && fields.title.toLowerCase().includes(t)) return weight;
-      return 0;
+    case "title": {
+      const titleMatch = matchSegment(t, fields.title, /[\s\-_]/g)
+        || (CJK_CHAR_RE.test(token) && fields.title.toLowerCase().includes(t));
+      if (!titleMatch) return 0;
+      return LOW_SIGNAL_TOKENS.has(t) ? weight * LOW_SIGNAL_PENALTY : weight;
+    }
 
     case "tags": {
       // Whole exact match first (highest), then segment match (penalized)

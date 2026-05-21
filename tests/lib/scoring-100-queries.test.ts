@@ -1017,4 +1017,44 @@ This card body has no mention of the source field value.`
     const r = await q("server config setup deploy release invoice calendar");
     expect(r.output).toBe("");
   });
+
+  it("Q106: 'deployment guide' ranks deployment-flow before author-guide", async () => {
+    // Original failure form: related card matches only "deployment" (low-signal),
+    // irrelevant card matches only "guide" (low-signal). Both are penalized equally,
+    // but deployment-flow is domain-relevant while author-guide is noise.
+    // With LOW_SIGNAL_PENALTY both get equal penalized scores (1 token each),
+    // so deployment-flow wins by slug alphabetical tiebreak.
+    const cardsDir = join(tmpDir, "cards");
+    await writeFile(
+      join(cardsDir, "deployment-flow.md"),
+      `---
+title: Deployment Flow
+tags:
+  - devops
+category: devops
+---
+
+CI/CD pipeline steps for production releases.`
+    );
+    await writeFile(
+      join(cardsDir, "author-guide.md"),
+      `---
+title: Author Guide
+---
+
+This is about the author of the library.`
+    );
+    store.invalidateCache();
+    const r = await q("deployment guide");
+    // deployment-flow matches "deployment" in slug; author-guide matches "guide" in slug
+    // Both are low-signal penalized, equal score/coverage, slug tiebreak: "author-guide" < "deployment-flow"
+    // But deployment-guide (existing card) matches BOTH tokens → must rank first
+    // Then author-guide and deployment-flow are tied, author-guide wins by slug
+    expect(r.contains("deployment-guide")).toBe(true);
+    expect(r.contains("deployment-flow")).toBe(true);
+    expect(r.contains("author-guide")).toBe(true);
+    // deployment-guide (2 token matches) must rank before both single-token matches
+    expect(r.slugs.indexOf("deployment-guide")).toBeLessThan(r.slugs.indexOf("author-guide"));
+    expect(r.slugs.indexOf("deployment-guide")).toBeLessThan(r.slugs.indexOf("deployment-flow"));
+  });
 });

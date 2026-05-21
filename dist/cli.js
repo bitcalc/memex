@@ -8113,12 +8113,15 @@ function matchTokenInField(token, field, fields, originalToken) {
   const t = token.toLowerCase();
   const weight = FIELD_WEIGHTS[field];
   switch (field) {
-    case "slug":
-      return matchSegment(t, fields.slug, /[-_\/]/g) ? weight : 0;
-    case "title":
-      if (matchSegment(t, fields.title, /[\s\-_]/g)) return weight;
-      if (CJK_CHAR_RE.test(token) && fields.title.toLowerCase().includes(t)) return weight;
-      return 0;
+    case "slug": {
+      if (!matchSegment(t, fields.slug, /[-_\/]/g)) return 0;
+      return LOW_SIGNAL_TOKENS.has(t) ? weight * LOW_SIGNAL_PENALTY : weight;
+    }
+    case "title": {
+      const titleMatch = matchSegment(t, fields.title, /[\s\-_]/g) || CJK_CHAR_RE.test(token) && fields.title.toLowerCase().includes(t);
+      if (!titleMatch) return 0;
+      return LOW_SIGNAL_TOKENS.has(t) ? weight * LOW_SIGNAL_PENALTY : weight;
+    }
     case "tags": {
       for (const tag of fields.tags) {
         if (tag.toLowerCase() === t) return weight;
@@ -8296,7 +8299,7 @@ function sortScoredMatches(matches) {
     return a.slug.localeCompare(b.slug);
   });
 }
-var FIELD_WEIGHTS, MAX_FIELD_WEIGHT, CODE_TOKEN_BOOST, SEGMENT_MATCH_PENALTY, EN_STOPWORDS, CJK_STOPWORDS, ALL_STOPWORDS, CODE_TOKEN_RE, CJK_RE, CJK_CHAR_RE, ASCII_TOKEN_RE, FIELD_ORDER, LOW_SIGNAL_TOKENS;
+var FIELD_WEIGHTS, MAX_FIELD_WEIGHT, CODE_TOKEN_BOOST, SEGMENT_MATCH_PENALTY, LOW_SIGNAL_PENALTY, EN_STOPWORDS, CJK_STOPWORDS, ALL_STOPWORDS, CODE_TOKEN_RE, CJK_RE, CJK_CHAR_RE, ASCII_TOKEN_RE, FIELD_ORDER, LOW_SIGNAL_TOKENS;
 var init_scoring = __esm({
   "src/lib/scoring.ts"() {
     "use strict";
@@ -8312,6 +8315,7 @@ var init_scoring = __esm({
     MAX_FIELD_WEIGHT = Math.max(...Object.values(FIELD_WEIGHTS));
     CODE_TOKEN_BOOST = 2;
     SEGMENT_MATCH_PENALTY = 0.8;
+    LOW_SIGNAL_PENALTY = 0.25;
     EN_STOPWORDS = /* @__PURE__ */ new Set([
       "how",
       "what",

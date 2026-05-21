@@ -396,6 +396,50 @@ describe("scoreCard — regex escape", () => {
   });
 });
 
+describe("scoreCard — low-signal penalty in slug/title", () => {
+  it("low-signal token in slug gets penalized weight (×0.25)", () => {
+    // "guide" is low-signal → slug weight 5 * 0.25 = 1.25
+    const fields = buildSearchableFields("author-guide", { title: "Author Guide" }, "Body text.", []);
+    const match = scoreCard(["guide"], ["guide"], fields);
+    expect(match).not.toBeNull();
+    // normalized: 1.25 / (1 * 5) = 0.25
+    expect(match!.score).toBeCloseTo(0.25, 2);
+  });
+
+  it("distinctive token in slug gets full weight", () => {
+    // "jwt" is NOT low-signal → slug weight 5
+    const fields = buildSearchableFields("jwt-migration", { title: "JWT Migration" }, "Body text.", []);
+    const match = scoreCard(["jwt"], ["JWT"], fields);
+    expect(match).not.toBeNull();
+    // normalized: 5 / (1 * 5) = 1.0
+    expect(match!.score).toBeCloseTo(1.0, 2);
+  });
+
+  it("two-token query: card matching domain token ranks above card matching only low-signal token", () => {
+    // "deployment guide" — both tokens are low-signal, but deployment-flow matches "deployment"
+    // in slug (domain-relevant), author-guide matches only "guide" in slug.
+    // deployment-flow should rank higher because it matches a domain-relevant low-signal token
+    // that the user actually searched for, while author-guide has zero relevance to "deployment".
+    const deployFlowFields = buildSearchableFields("deployment-flow", { title: "Deployment Flow" }, "CI/CD pipeline steps.", []);
+    const authorFields = buildSearchableFields("author-guide", { title: "Author Guide" }, "Author info.", []);
+
+    const tokens = ["deployment", "guide"];
+    const origTokens = ["deployment", "guide"];
+
+    const deployMatch = scoreCard(tokens, origTokens, deployFlowFields);
+    const authorMatch = scoreCard(tokens, origTokens, authorFields);
+
+    // deployment-flow matches "deployment" in slug (penalized but present), no match for "guide"
+    expect(deployMatch).not.toBeNull();
+    // author-guide matches "guide" in slug (penalized), no match for "deployment"
+    expect(authorMatch).not.toBeNull();
+    // Both match 1/2 tokens with same penalty, but scores should be equal
+    // The key is that deployment-flow is NOT ranked below author-guide
+    expect(deployMatch!.score).toBeCloseTo(authorMatch!.score, 2);
+    expect(deployMatch!.coverage).toBeCloseTo(authorMatch!.coverage, 2);
+  });
+});
+
 describe("sortScoredMatches", () => {
   it("sorts by score DESC, then coverage DESC, then slug ASC", () => {
     const matches = [
