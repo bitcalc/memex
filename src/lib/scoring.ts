@@ -11,6 +11,7 @@ export interface ScoredMatch {
   coverage: number;          // matchedTokens / effectiveTokens
   matchedTokens: number;
   effectiveTokens: number;
+  firstMatchIndex: number;   // earliest matched token position in query (0-based)
   matchLine: string;         // first matching line for display
   matchedFields: string[];   // e.g. ["tag:auth", "body:JWT"]
 }
@@ -326,6 +327,7 @@ export function scoreCard(
 
   let totalScore = 0;
   let matchedCount = 0;
+  let firstMatchIndex = -1;
   const matchedFields: string[] = [];
   let firstMatchLine = "";
   let hasHighSignalMatch = false;  // for threshold exemption
@@ -336,7 +338,8 @@ export function scoreCard(
     originalMap.set(ot.toLowerCase(), ot);
   }
 
-  for (const token of tokens) {
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
     const origToken = originalMap.get(token) ?? token;
     let bestWeight = 0;
     let bestField = "";
@@ -353,6 +356,7 @@ export function scoreCard(
     if (bestWeight > 0) {
       totalScore += bestWeight;
       matchedCount++;
+      if (firstMatchIndex === -1) firstMatchIndex = i;
       matchedFields.push(`${bestField}:${token}`);
 
       // Check high-signal exemption
@@ -383,6 +387,7 @@ export function scoreCard(
     coverage,
     matchedTokens: matchedCount,
     effectiveTokens,
+    firstMatchIndex,
     matchLine: firstMatchLine,
     matchedFields,
   };
@@ -469,11 +474,12 @@ function findMatchLine(
   return "";
 }
 
-/** Sort scored matches: score DESC → coverage DESC → slug ASC */
+/** Sort scored matches: score DESC → coverage DESC → firstMatchIndex ASC → slug ASC */
 export function sortScoredMatches(matches: ScoredMatch[]): ScoredMatch[] {
   return matches.sort((a, b) => {
     if (b.score !== a.score) return b.score - a.score;
     if (b.coverage !== a.coverage) return b.coverage - a.coverage;
+    if (a.firstMatchIndex !== b.firstMatchIndex) return a.firstMatchIndex - b.firstMatchIndex;
     return a.slug.localeCompare(b.slug);
   });
 }

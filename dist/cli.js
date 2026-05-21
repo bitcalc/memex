@@ -8205,6 +8205,7 @@ function scoreCard(tokens, originalTokens, fields) {
   if (effectiveTokens === 0) return null;
   let totalScore = 0;
   let matchedCount = 0;
+  let firstMatchIndex = -1;
   const matchedFields = [];
   let firstMatchLine = "";
   let hasHighSignalMatch = false;
@@ -8212,7 +8213,8 @@ function scoreCard(tokens, originalTokens, fields) {
   for (const ot of originalTokens) {
     originalMap.set(ot.toLowerCase(), ot);
   }
-  for (const token of tokens) {
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
     const origToken = originalMap.get(token) ?? token;
     let bestWeight = 0;
     let bestField = "";
@@ -8226,6 +8228,7 @@ function scoreCard(tokens, originalTokens, fields) {
     if (bestWeight > 0) {
       totalScore += bestWeight;
       matchedCount++;
+      if (firstMatchIndex === -1) firstMatchIndex = i;
       matchedFields.push(`${bestField}:${token}`);
       if (isHighSignalMatch(token, bestField)) {
         hasHighSignalMatch = true;
@@ -8247,6 +8250,7 @@ function scoreCard(tokens, originalTokens, fields) {
     coverage,
     matchedTokens: matchedCount,
     effectiveTokens,
+    firstMatchIndex,
     matchLine: firstMatchLine,
     matchedFields
   };
@@ -8296,6 +8300,7 @@ function sortScoredMatches(matches) {
   return matches.sort((a, b) => {
     if (b.score !== a.score) return b.score - a.score;
     if (b.coverage !== a.coverage) return b.coverage - a.coverage;
+    if (a.firstMatchIndex !== b.firstMatchIndex) return a.firstMatchIndex - b.firstMatchIndex;
     return a.slug.localeCompare(b.slug);
   });
 }

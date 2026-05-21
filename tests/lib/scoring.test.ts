@@ -415,11 +415,9 @@ describe("scoreCard — low-signal penalty in slug/title", () => {
     expect(match!.score).toBeCloseTo(1.0, 2);
   });
 
-  it("two-token query: card matching domain token ranks above card matching only low-signal token", () => {
-    // "deployment guide" — both tokens are low-signal, but deployment-flow matches "deployment"
-    // in slug (domain-relevant), author-guide matches only "guide" in slug.
-    // deployment-flow should rank higher because it matches a domain-relevant low-signal token
-    // that the user actually searched for, while author-guide has zero relevance to "deployment".
+  it("two-token query: card matching earlier query token gets lower firstMatchIndex", () => {
+    // "deployment guide" — both low-signal. deployment-flow matches "deployment" (index 0),
+    // author-guide matches "guide" (index 1). Same score/coverage, but firstMatchIndex breaks tie.
     const deployFlowFields = buildSearchableFields("deployment-flow", { title: "Deployment Flow" }, "CI/CD pipeline steps.", []);
     const authorFields = buildSearchableFields("author-guide", { title: "Author Guide" }, "Author info.", []);
 
@@ -429,32 +427,58 @@ describe("scoreCard — low-signal penalty in slug/title", () => {
     const deployMatch = scoreCard(tokens, origTokens, deployFlowFields);
     const authorMatch = scoreCard(tokens, origTokens, authorFields);
 
-    // deployment-flow matches "deployment" in slug (penalized but present), no match for "guide"
     expect(deployMatch).not.toBeNull();
-    // author-guide matches "guide" in slug (penalized), no match for "deployment"
     expect(authorMatch).not.toBeNull();
-    // Both match 1/2 tokens with same penalty, but scores should be equal
-    // The key is that deployment-flow is NOT ranked below author-guide
     expect(deployMatch!.score).toBeCloseTo(authorMatch!.score, 2);
-    expect(deployMatch!.coverage).toBeCloseTo(authorMatch!.coverage, 2);
+    expect(deployMatch!.firstMatchIndex).toBe(0);  // matched "deployment" at position 0
+    expect(authorMatch!.firstMatchIndex).toBe(1);   // matched "guide" at position 1
+  });
+});
+
+describe("scoreCard — firstMatchIndex tracking", () => {
+  it("firstMatchIndex is 0 when first token matches", () => {
+    const fields = buildSearchableFields("jwt-migration", { title: "JWT Migration" }, "Body.", []);
+    const match = scoreCard(["jwt", "redis"], ["JWT", "redis"], fields);
+    expect(match).not.toBeNull();
+    expect(match!.firstMatchIndex).toBe(0);
+  });
+
+  it("firstMatchIndex is 1 when only second token matches", () => {
+    const fields = buildSearchableFields("jwt-migration", { title: "JWT Migration" }, "Body.", []);
+    const match = scoreCard(["redis", "jwt"], ["redis", "JWT"], fields);
+    expect(match).not.toBeNull();
+    expect(match!.firstMatchIndex).toBe(1);
   });
 });
 
 describe("sortScoredMatches", () => {
-  it("sorts by score DESC, then coverage DESC, then slug ASC", () => {
+  it("sorts by score DESC, then coverage DESC, then firstMatchIndex ASC, then slug ASC", () => {
     const matches = [
-      { slug: "c-card", score: 0.5, coverage: 0.5, matchedTokens: 1, effectiveTokens: 2, matchLine: "", matchedFields: [] },
-      { slug: "a-card", score: 0.8, coverage: 0.5, matchedTokens: 2, effectiveTokens: 2, matchLine: "", matchedFields: [] },
-      { slug: "b-card", score: 0.8, coverage: 0.7, matchedTokens: 2, effectiveTokens: 2, matchLine: "", matchedFields: [] },
-      { slug: "d-card", score: 0.8, coverage: 0.7, matchedTokens: 2, effectiveTokens: 2, matchLine: "", matchedFields: [] },
+      { slug: "c-card", score: 0.5, coverage: 0.5, matchedTokens: 1, effectiveTokens: 2, firstMatchIndex: 0, matchLine: "", matchedFields: [] },
+      { slug: "a-card", score: 0.8, coverage: 0.5, matchedTokens: 2, effectiveTokens: 2, firstMatchIndex: 0, matchLine: "", matchedFields: [] },
+      { slug: "b-card", score: 0.8, coverage: 0.7, matchedTokens: 2, effectiveTokens: 2, firstMatchIndex: 0, matchLine: "", matchedFields: [] },
+      { slug: "d-card", score: 0.8, coverage: 0.7, matchedTokens: 2, effectiveTokens: 2, firstMatchIndex: 0, matchLine: "", matchedFields: [] },
     ];
 
     sortScoredMatches(matches);
 
     expect(matches[0].slug).toBe("b-card"); // highest score, highest coverage
-    expect(matches[1].slug).toBe("d-card"); // same score+coverage, slug alphabetical
+    expect(matches[1].slug).toBe("d-card"); // same score+coverage+firstMatchIndex, slug alphabetical
     expect(matches[2].slug).toBe("a-card"); // same score, lower coverage
     expect(matches[3].slug).toBe("c-card"); // lowest score
+  });
+
+  it("breaks ties with firstMatchIndex before slug", () => {
+    const matches = [
+      { slug: "a-card", score: 0.5, coverage: 0.5, matchedTokens: 1, effectiveTokens: 2, firstMatchIndex: 1, matchLine: "", matchedFields: [] },
+      { slug: "b-card", score: 0.5, coverage: 0.5, matchedTokens: 1, effectiveTokens: 2, firstMatchIndex: 0, matchLine: "", matchedFields: [] },
+    ];
+
+    sortScoredMatches(matches);
+
+    // b-card has lower firstMatchIndex (0 < 1), ranks first despite slug "b" > "a"
+    expect(matches[0].slug).toBe("b-card");
+    expect(matches[1].slug).toBe("a-card");
   });
 });
 
