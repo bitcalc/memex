@@ -40874,9 +40874,9 @@ function registerOperations(server, store, hooks, home, getClientName) {
     return { content: [{ type: "text", text }], isError };
   }
   server.registerTool("memex_recall", {
-    description: "IMPORTANT: You MUST call this at the START of every new task or conversation, BEFORE doing any work. This retrieves your persistent memory \u2014 knowledge cards from previous sessions with [[bidirectional links]]. Returns the keyword index (if exists) or card list. USAGE: Call with NO query first to get the index. Only use query when you need to find specific cards \u2014 multi-word queries work well (ranked OR with field-weighted scoring). For natural-language search, use memex_search with semantic=true instead. Never include actual secrets, credentials, tokens, or exact secret file contents in query.",
+    description: "Retrieve persistent memory \u2014 knowledge cards from previous sessions with [[bidirectional links]]. Use when prior memory is likely relevant to the current task. Prefer a task-specific query with 1-3 keywords (ranked OR with field-weighted scoring). Call with no query only when you need the full memory index. For natural-language search, use memex_search with semantic=true instead. Never include actual secrets, credentials, tokens, or exact secret file contents in query.",
     inputSchema: external_exports3.object({
-      query: external_exports3.string().optional().describe("Keywords for ranked OR search \u2014 more matching tokens = higher rank. Multi-word queries are supported (e.g. 'JWT token rotation'). Omit for task-start recall. Do not include raw secrets."),
+      query: external_exports3.string().optional().describe("Keywords for ranked OR search \u2014 more matching tokens = higher rank. Multi-word queries are supported (e.g. 'JWT token rotation'). Omit only when you need the memory index. Do not include raw secrets."),
       category: external_exports3.string().optional().describe("Filter by frontmatter category"),
       tag: external_exports3.string().optional().describe("Filter by frontmatter tag"),
       author: external_exports3.string().optional().describe("Filter by frontmatter author/source"),
