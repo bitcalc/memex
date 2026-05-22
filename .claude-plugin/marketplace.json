@@ -9,7 +9,7 @@
     {
       "name": "memex",
       "description": "Zettelkasten-based agent memory system with bidirectional links",
-      "version": "0.1.8",
+      "version": "0.3.1",
       "source": "./"
     }
   ]
